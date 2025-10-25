@@ -11,6 +11,9 @@ from ema_pytorch import EMA
 from torch.optim import Adam
 from torch.nn.utils import clip_grad_norm_
 from Utils.io_utils import instantiate_from_config, get_model_parameters_info
+import csv
+import matplotlib.pyplot as plt
+from IPython.display import clear_output
 
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
@@ -97,13 +100,26 @@ class Trainer(object):
     def train(self):
         device = self.device
         step = 0
+        loss_log = []  # 保存loss记录
+        csv_path = os.path.join(self.results_folder, "loss_log.csv")
+        os.makedirs(self.results_folder, exist_ok=True)
+
+        # 初始化CSV文件
+        with open(csv_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "loss"])
+
         if self.logger is not None:
             tic = time.time()
-            self.logger.log_info('{}: start training...'.format(self.args.name), check_primary=False)
+            self.logger.log_info(f"{self.args.config_path}: start training...", check_primary=False)
+
+        plt.ion()  # 开启交互式绘图模式（Notebook 实时刷新）
 
         with tqdm(initial=step, total=self.train_num_steps) as pbar:
             while step < self.train_num_steps:
-                total_loss = 0.
+                total_loss = 0.0
+
+                # === 梯度累积 ===
                 for _ in range(self.gradient_accumulate_every):
                     data = next(self.dl).to(device)
                     loss = self.model(data, target=data)
@@ -111,8 +127,7 @@ class Trainer(object):
                     loss.backward()
                     total_loss += loss.item()
 
-                pbar.set_description(f'loss: {total_loss:.6f}')
-
+                # === 优化器更新 ===
                 clip_grad_norm_(self.model.parameters(), 1.0)
                 self.opt.step()
                 self.sch.step(total_loss)
@@ -121,27 +136,57 @@ class Trainer(object):
                 step += 1
                 self.ema.update()
 
-                with torch.no_grad():
-                    if self.step != 0 and self.step % self.save_cycle == 0:
-                        self.milestone += 1
-                        self.save(self.milestone)
-                        # self.logger.log_info('saved in {}'.format(str(self.results_folder / f'checkpoint-{self.milestone}.pt')))
-                    
-                    if self.logger is not None and self.step % self.log_frequency == 0:
-                        # info = '{}: train'.format(self.args.name)
-                        # info = info + ': Epoch {}/{}'.format(self.step, self.train_num_steps)
-                        # info += ' ||'
-                        # info += '' if loss_f == 'none' else ' Fourier Loss: {:.4f}'.format(loss_f.item())
-                        # info += '' if loss_r == 'none' else ' Reglarization: {:.4f}'.format(loss_r.item())
-                        # info += ' | Total Loss: {:.6f}'.format(total_loss)
-                        # self.logger.log_info(info)
-                        self.logger.add_scalar(tag='train/loss', scalar_value=total_loss, global_step=self.step)
+                # === 记录loss ===
+                loss_log.append(total_loss)
+                with open(csv_path, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([step, total_loss])
 
+                # === tqdm显示 ===
+                pbar.set_description(f"loss: {total_loss:.6f}")
                 pbar.update(1)
 
-        print('training complete')
+                # === 实时绘图（每10步刷新一次）===
+                if step % 10 == 0:
+                    clear_output(wait=True)
+                    plt.figure(figsize=(7, 4))
+                    plt.plot(np.arange(1, len(loss_log) + 1), loss_log, color="tab:blue", linewidth=2)
+                    plt.xlabel("Step")
+                    plt.ylabel("Loss")
+                    plt.title("Training Loss (Real-time)")
+                    plt.grid(True)
+                    plt.tight_layout()
+                    plt.show()
+
+                # === 定期保存模型 ===
+                if self.step != 0 and self.step % self.save_cycle == 0:
+                    self.milestone += 1
+                    self.save(self.milestone)
+
+                # === 记录日志 ===
+                if self.logger is not None and self.step % self.log_frequency == 0:
+                    self.logger.add_scalar(tag="train/loss", scalar_value=total_loss, global_step=self.step)
+
+        # === 训练完成 ===
+        plt.ioff()
+        plt.figure(figsize=(8, 5))
+        plt.plot(np.arange(1, len(loss_log) + 1), loss_log, label="Training Loss", color="blue")
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("Final Training Loss Curve")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        final_path = os.path.join(self.results_folder, "loss_curve.png")
+        plt.savefig(final_path, dpi=300)
+        plt.close()
+
+        print(f"✅ Training complete! Loss curve saved to {final_path}")
+        print(f"✅ CSV log saved to {csv_path}")
+
         if self.logger is not None:
-            self.logger.log_info('Training done, time: {:.2f}'.format(time.time() - tic))
+            self.logger.log_info(f"Training done, time: {time.time() - tic:.2f}s")
+
 
     def sample(self, num, size_every, shape=None, model_kwargs=None, cond_fn=None):
         if self.logger is not None:

@@ -51,27 +51,54 @@ class Diffusion_TS(nn.Module):
             resid_pd=0.,
             kernel_size=None,
             padding_size=None,
-            use_ff=True,
-            reg_weight=None,
+            use_ff=False,          # 不使用 FFT（CSI 无相位）
+            reg_weight=None,       # Fourier loss 权重（保留参数但不使用）
+            corr_weight=0.1,       # 🔹新增：时间相关性正则项的权重
             **kwargs
     ):
+        """
+        Diffusion-TS 模型初始化。
+        支持标准扩散参数配置，同时允许关闭 FFT 约束并添加时序相关性正则项。
+        """
+
         super(Diffusion_TS, self).__init__()
 
-        self.eta, self.use_ff = eta, use_ff
+        # ========== 基本配置 ==========
+        self.eta = eta
+        self.use_ff = use_ff
         self.seq_length = seq_length
         self.feature_size = feature_size
+        self.corr_weight = corr_weight  # 🔹新增：时间相关性损失权重
+        self._corr_eps = 1e-6          # 数值稳定常数
+        self.corr_time_weight = 0.5    # 时间自相关权重相对通道相关的权重
+        self.corr_max_lag = 10         # 计算自相关的最大时间延迟
+
+        # Fourier loss 权重（若 use_ff=False，将不会被使用）
         self.ff_weight = default(reg_weight, math.sqrt(self.seq_length) / 5)
 
-        self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
-                                 n_heads=n_heads, attn_pdrop=attn_pd, resid_pdrop=resid_pd, mlp_hidden_times=mlp_hidden_times,
-                                 max_len=seq_length, n_embd=d_model, conv_params=[kernel_size, padding_size], **kwargs)
+        # ========== Transformer 编码器/解码器 ==========
+        self.model = Transformer(
+            n_feat=feature_size,
+            n_channel=seq_length,
+            n_layer_enc=n_layer_enc,
+            n_layer_dec=n_layer_dec,
+            n_heads=n_heads,
+            attn_pdrop=attn_pd,
+            resid_pdrop=resid_pd,
+            mlp_hidden_times=mlp_hidden_times,
+            max_len=seq_length,
+            n_embd=d_model,
+            conv_params=[kernel_size, padding_size],
+            **kwargs
+        )
 
+        # ========== β 调度策略 ==========
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)
         elif beta_schedule == 'cosine':
             betas = cosine_beta_schedule(timesteps)
         else:
-            raise ValueError(f'unknown beta schedule {beta_schedule}')
+            raise ValueError(f'Unknown beta schedule: {beta_schedule}')
 
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
@@ -81,47 +108,38 @@ class Diffusion_TS(nn.Module):
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
-        # sampling related parameters
-
-        self.sampling_timesteps = default(
-            sampling_timesteps, timesteps)  # default num sampling timesteps to number of timesteps at training
-
+        # ========== 采样配置 ==========
+        self.sampling_timesteps = default(sampling_timesteps, timesteps)
         assert self.sampling_timesteps <= timesteps
         self.fast_sampling = self.sampling_timesteps < timesteps
 
-        # helper function to register buffer from float64 to float32
-
+        # ========== 注册缓冲参数 ==========
         register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
-
         register_buffer('betas', betas)
         register_buffer('alphas_cumprod', alphas_cumprod)
         register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
 
-        # calculations for diffusion q(x_t | x_{t-1}) and others
-
+        # 扩散相关计算参数
         register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
         register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
         register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
         register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
         register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
 
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
-
+        # 后验分布计算参数
         posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
-
-        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
-
         register_buffer('posterior_variance', posterior_variance)
-
-        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
-
         register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
-        # calculate reweighting
-        
+        # 损失重加权项（对应论文中 training reweighting）
         register_buffer('loss_weight', torch.sqrt(alphas) * torch.sqrt(1. - alphas_cumprod) / betas / 100)
+
+        # ========== 调试信息 ==========
+        print(f"[Diffusion_TS] Initialized with seq_length={seq_length}, feature_size={feature_size}, "
+            f"use_ff={use_ff}, corr_weight={corr_weight}")
+
 
     def predict_noise_from_start(self, x_t, t, x0):
         return (
@@ -245,27 +263,123 @@ class Diffusion_TS(nn.Module):
         )
 
     def _train_loss(self, x_start, t, target=None, noise=None, padding_masks=None):
+        """
+        Compute training loss:
+        - base pointwise loss (L1 or L2) per element -> reduced per-sample
+        - optional Fourier loss (if self.use_ff)
+        - channel correlation loss (per-sample)
+        - multi-lag temporal autocorrelation loss (per-sample)
+        - derivative (first-difference) loss (per-sample)
+        The per-sample losses are combined with weights and finally reweighted by time-dependent loss_weight.
+        """
+
+        # ---------- defaults & safety ----------
+        device = x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
         if target is None:
             target = x_start
 
-        x = self.q_sample(x_start=x_start, t=t, noise=noise)  # noise sample
-        model_out = self.output(x, t, padding_masks)
+        # hyperparams (allow overriding via self in __init__)
+        eps = getattr(self, "_corr_eps", 1e-8)
+        corr_weight = getattr(self, "corr_weight", 0.1)            # overall corr loss weight
+        corr_time_weight = getattr(self, "corr_time_weight", 1.0)  # weight between channel-corr and temporal-corr
+        corr_lags = getattr(self, "corr_lags", [1, 2, 4, 8, 16, 32])   # multi-lag list
+        w_delta = getattr(self, "w_delta", 0.5)                    # derivative loss weight
 
-        train_loss = self.loss_fn(model_out, target, reduction='none')
+        # ---------- base diffusion noise + model output ----------
+        x = self.q_sample(x_start=x_start, t=t, noise=noise)  # (B, C, T)
+        model_out = self.output(x, t, padding_masks)         # (B, C, T)
 
-        fourier_loss = torch.tensor([0.])
+        # ---------- base pointwise loss (reduction='none' for now) ----------
+        # train_loss_elem: (B, C, T)
+        train_loss_elem = self.loss_fn(model_out, target, reduction='none')
+
+        # ---------- optional Fourier loss (kept as before) ----------
         if self.use_ff:
             fft1 = torch.fft.fft(model_out.transpose(1, 2), norm='forward')
             fft2 = torch.fft.fft(target.transpose(1, 2), norm='forward')
             fft1, fft2 = fft1.transpose(1, 2), fft2.transpose(1, 2)
-            fourier_loss = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none')\
-                           + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
-            train_loss +=  self.ff_weight * fourier_loss
-        
-        train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
-        train_loss = train_loss * extract(self.loss_weight, t, train_loss.shape)
-        return train_loss.mean()
+            fourier_loss_elem = self.loss_fn(torch.real(fft1), torch.real(fft2), reduction='none') \
+                            + self.loss_fn(torch.imag(fft1), torch.imag(fft2), reduction='none')
+            train_loss_elem = train_loss_elem + self.ff_weight * fourier_loss_elem
+        else:
+            fourier_loss_elem = torch.zeros_like(train_loss_elem, device=device)
+
+        # ---------- reduce elementwise loss to per-sample mean ----------
+        # train_loss_elem: (B, C, T) -> base_loss_per_sample: (B,)
+        base_loss_per_sample = reduce(train_loss_elem, 'b ... -> b', 'mean')  # ✅ 修复
+
+        # ---------- channel-correlation loss (per-sample) ----------
+        B, C, T = model_out.shape
+        Xm, Ym = model_out, target
+
+        # center by time-mean (keepdim for broadcasting)
+        Xc = Xm - Xm.mean(dim=2, keepdim=True)
+        Yc = Ym - Ym.mean(dim=2, keepdim=True)
+
+        # sample-wise covariance matrices: (B, C, C)
+        cov_X = torch.matmul(Xc, Xc.transpose(1, 2)) / float(max(T - 1, 1))
+        cov_Y = torch.matmul(Yc, Yc.transpose(1, 2)) / float(max(T - 1, 1))
+
+        # variances per channel: (B, C)
+        var_X = cov_X.diagonal(dim1=1, dim2=2)
+        var_Y = cov_Y.diagonal(dim1=1, dim2=2)
+
+        # standard deviations with eps for stability
+        std_X = torch.sqrt(var_X.clamp(min=0.) + eps)
+        std_Y = torch.sqrt(var_Y.clamp(min=0.) + eps)
+
+        # denom outer products (B, C, C)
+        denom_X = std_X.unsqueeze(2) * std_X.unsqueeze(1) + eps
+        denom_Y = std_Y.unsqueeze(2) * std_Y.unsqueeze(1) + eps
+
+        # correlation matrices (clamped to [-1,1])
+        corr_X = (cov_X / denom_X).clamp(-1.0, 1.0)
+        corr_Y = (cov_Y / denom_Y).clamp(-1.0, 1.0)
+
+        # channel correlation loss per-sample
+        channel_corr_loss_mat = F.l1_loss(corr_X, corr_Y, reduction='none')  # (B, C, C)
+        channel_corr_loss = channel_corr_loss_mat.view(B, -1).mean(dim=1)    # (B,)
+
+        # ---------- temporal multi-lag autocorrelation loss (per-sample) ----------
+        valid_lags = [k for k in corr_lags if 1 <= k <= (T - 1)]
+        if len(valid_lags) == 0:
+            temporal_autocorr_loss = torch.zeros((B,), device=device)
+        else:
+            temporal_losses = torch.zeros((B, C), device=device)
+            for k in valid_lags:
+                num_X = (Xc[:, :, :T - k] * Xc[:, :, k:]).sum(dim=2)
+                num_Y = (Yc[:, :, :T - k] * Yc[:, :, k:]).sum(dim=2)
+                denom = ((T - k) * (std_X * std_X + eps))
+                ac_X = num_X / (denom + eps)
+                ac_Y = num_Y / (denom + eps)
+                temporal_losses += torch.abs(ac_X - ac_Y)
+            temporal_autocorr_loss = temporal_losses.mean(dim=1) / float(len(valid_lags))
+
+        # ---------- derivative (first-difference) loss ----------
+        if T >= 2:
+            delta_out = model_out[:, :, 1:] - model_out[:, :, :-1]
+            delta_target = target[:, :, 1:] - target[:, :, :-1]
+            delta_elem = F.l1_loss(delta_out, delta_target, reduction='none')
+            delta_loss_per_sample = reduce(delta_elem, 'b ... -> b', 'mean')
+        else:
+            delta_loss_per_sample = torch.zeros((B,), device=device)
+
+        # ---------- combine correlation losses ----------
+        corr_loss_batch = channel_corr_loss + corr_time_weight * temporal_autocorr_loss  # (B,)
+
+        # ---------- assemble final per-sample loss ----------
+        combined_per_sample = base_loss_per_sample \
+                            + corr_weight * corr_loss_batch \
+                            + w_delta * delta_loss_per_sample  # (B,)
+
+        # ---------- apply time-dependent weighting ----------
+        combined_per_sample = combined_per_sample * extract(self.loss_weight, t, combined_per_sample.shape)
+
+        # ---------- final mean ----------
+        return combined_per_sample.mean()
+
+
 
     def forward(self, x, **kwargs):
         b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
